@@ -434,7 +434,7 @@ def _save_trajectory_error_statistics(trajectories, out_prefix, boundary):
                 e = item["energies"].sum(axis=1) if column is None else item["energies"][:, column]
                 row = _full_time_metric_values(e, item["duration"], item["boundary_length"], boundary)
                 values[channel].append(row)
-                writer.writerow(["test_one_step_right_endpoint", source_id, sample_id, channel,
+                writer.writerow(["test_autoregressive_rollout_right_endpoint", source_id, sample_id, channel,
                                  item["duration"], item["steps"], item["boundary_length"]] + row)
     summary_path = out_prefix + "_full_time_errors.csv"
     with open(summary_path, "w", newline="", encoding="utf-8") as handle:
@@ -445,7 +445,7 @@ def _save_trajectory_error_statistics(trajectories, out_prefix, boundary):
             array = np.asarray(rows, dtype=np.float64)
             with np.errstate(invalid="ignore"):
                 means, stds = array.mean(axis=0), array.std(axis=0, ddof=0)
-            writer.writerow(["test_one_step_right_endpoint", channel, len(rows), 0] +
+            writer.writerow(["test_autoregressive_rollout_right_endpoint", channel, len(rows), 0] +
                             [value for pair in zip(means, stds) for value in pair])
             text = " | ".join(f"{metric}={mean:.8g} +/- {std:.8g}"
                               for metric, mean, std in zip(metrics, means, stds))
@@ -1440,29 +1440,34 @@ def _evaluation_trajectory_keys(blob):
 
 @torch.no_grad()
 def evaluate_full_time_test(model, blob, test_idx, basis_np, args):
-    """Same per-trajectory right-endpoint statistics and CSV schema as FDM."""
+    """Autoregressive test trajectories, integrated by the physical-time right-endpoint rule."""
     model.eval()
     keys = _evaluation_trajectory_keys(blob)
     quadrature = DiskErrorQuadrature(basis_np["points"], basis_np["mass_w"], args.Nr, args.Ntheta)
+    grouped = {}
+    for index in np.asarray(test_idx, dtype=np.int64):
+        grouped.setdefault(keys[int(index)], []).append(int(index))
     trajectories = {}
-    for start in range(0, len(test_idx), int(args.batch_size)):
-        indices = np.asarray(test_idx[start:start + int(args.batch_size)], dtype=np.int64)
-        xb = blob["x"][indices].to(DEVICE).float()
-        dtb = blob["dt"][indices].to(DEVICE).float()
-        target = blob["y"][indices].to(DEVICE).float()
-        dt = dtb.double() * float(blob["_effective_dt_scale"])
-        if not torch.isfinite(dt).all() or (dt < 0).any():
-            raise ValueError("Full-time evaluation requires finite nonnegative physical dt")
-        energies = quadrature.energies(model(xb, dtb), target)
-        contributions = (energies * dt[:, None, None]).cpu().numpy()
-        for index, contribution, duration in zip(indices, contributions, dt.cpu().tolist()):
-            item = trajectories.setdefault(keys[int(index)], {
-                "energies": np.zeros((5, 2)), "duration": 0., "steps": 0,
-                "boundary_length": quadrature.boundary_length,
-            })
-            item["energies"] += contribution
-            item["duration"] += duration
+    for key, indices in grouped.items():
+        # Restrict ordering to this test trajectory; never pull in other samples.
+        sequence = _rollout_sequence_indices(blob, None, np.asarray(indices))
+        current = None
+        item = {"energies": np.zeros((5, 2)), "duration": 0., "steps": 0,
+                "boundary_length": quadrature.boundary_length}
+        for index in sequence:
+            xb = blob["x"][int(index)].unsqueeze(0).to(DEVICE).float().clone()
+            dtb = blob["dt"][int(index)].reshape(1).to(DEVICE).float()
+            target = blob["y"][int(index)].unsqueeze(0).to(DEVICE).float()
+            dt = float(dtb.double().item()) * float(blob["_effective_dt_scale"])
+            if not math.isfinite(dt) or dt <= 0:
+                raise ValueError("Full-time rollout requires finite positive physical dt")
+            if current is not None:
+                xb[..., :2] = current
+            current = model(xb, dtb)
+            item["energies"] += quadrature.energies(current, target)[0].cpu().numpy() * dt
+            item["duration"] += dt
             item["steps"] += 1
+        trajectories[key] = item
     _save_trajectory_error_statistics(trajectories, os.path.join(args.save_dir, args.out_prefix) + "_test", "neumann")
     return trajectories
 

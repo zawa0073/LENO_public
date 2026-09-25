@@ -398,7 +398,7 @@ def _dataset_boundary_entries(dataset, seen=None):
         )]
 
     entries = []
-    for attr in ("base", "dataset", "ds_full", "ds_low"):
+    for attr in ("base", "dataset"):
         entries.extend(_dataset_boundary_entries(getattr(dataset, attr, None), seen=seen))
     for item in getattr(dataset, "sources", []):
         child = item.get("dataset") if isinstance(item, dict) else item
@@ -1166,20 +1166,6 @@ def normalize_index(idx_obj, root_dir):
     return shard_paths, shard_ns, total
 
 
-def build_spatial_subsample_indices(Ny_full: int, Nx_full: int, low_hw: int):
-    Ny_full, Nx_full, low_hw = int(Ny_full), int(Nx_full), int(low_hw)
-    if low_hw < 2:
-        raise ValueError(f"low_hw must be >= 2 for source-grid subsampling. got {low_hw}")
-    if low_hw > Ny_full or low_hw > Nx_full:
-        raise ValueError(
-            f"low_hw must not exceed source resolution. low_hw={low_hw}, "
-            f"source=({Ny_full},{Nx_full})"
-        )
-    y_idx = np.rint(np.linspace(0, Ny_full - 1, low_hw)).astype(np.int64)
-    x_idx = np.rint(np.linspace(0, Nx_full - 1, low_hw)).astype(np.int64)
-    return y_idx, x_idx
-
-
 def _as_numpy_1d(value):
     if value is None:
         return None
@@ -1687,187 +1673,6 @@ class BudgetCachedShardedPTDataset(Dataset):
         return blob["x"][local], blob["y"][local], third
 
 
-class SourceGridSubsampledPTDataset(Dataset):
-    def __init__(self, base: Dataset, low_hw: int):
-        super().__init__()
-        self.base = base
-        self.low_hw = int(low_hw)
-        self.source_Ny = int(getattr(base, "Ny", -1))
-        self.source_Nx = int(getattr(base, "Nx", -1))
-        self.Cin = int(getattr(base, "Cin", -1))
-        if self.source_Ny <= 0 or self.source_Nx <= 0:
-            raise ValueError("base dataset must expose positive Ny/Nx")
-
-        y_idx, x_idx = build_spatial_subsample_indices(self.source_Ny, self.source_Nx, self.low_hw)
-        self.Ny = int(y_idx.size)
-        self.Nx = int(x_idx.size)
-        self.y_idx = torch.as_tensor(y_idx, dtype=torch.long)
-        self.x_idx = torch.as_tensor(x_idx, dtype=torch.long)
-        self.index = getattr(base, "index", {})
-
-    def __len__(self):
-        return len(self.base)
-
-    def __getitem__(self, idx: int):
-        x, y, t_cumulative = self.base[int(idx)]
-        x_low = x.index_select(0, self.y_idx).index_select(1, self.x_idx)
-        y_low = y.index_select(0, self.y_idx).index_select(1, self.x_idx)
-        return x_low, y_low, t_cumulative
-
-
-def maybe_source_grid_subsample_dataset(ds: Dataset, low_hw):
-    if low_hw is None:
-        return ds
-    low_hw = int(low_hw)
-    Ny = int(getattr(ds, "Ny", -1))
-    Nx = int(getattr(ds, "Nx", -1))
-    if low_hw == Ny and low_hw == Nx:
-        return ds
-    return SourceGridSubsampledPTDataset(ds, low_hw)
-
-
-# -------------------------
-# aligned mix dataset (full/low)
-# -------------------------
-_MASK64 = (1 << 64) - 1
-
-
-def _u01_from_seed_idx(seed: int, idx: int) -> float:
-    # splitmix64 (deterministic, worker-safe)
-    z = (int(seed) + 0x9E3779B97F4A7C15 + int(idx)) & _MASK64
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9 & _MASK64
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB & _MASK64
-    z = (z ^ (z >> 31)) & _MASK64
-    return float(z) / float(1 << 64)
-
-
-class AlignedMixDataset(Dataset):
-    # full/low datasets must share the same split and sample ordering.
-    def __init__(self, ds_full: Dataset, ds_low: Dataset, full_ratio: float, seed: int = 0):
-        super().__init__()
-        self.ds_full = ds_full
-        self.ds_low = ds_low
-        self.full_ratio = float(full_ratio)
-        self.seed = int(seed)
-        n1 = len(ds_full)
-        n2 = len(ds_low)
-        if n1 != n2:
-            raise ValueError(f"full/low length mismatch: full={n1} low={n2}. "
-                             f"Ensure both datasets were built from the same split and identical ordering.")
-        self.total = int(n1)
-
-    def __len__(self):
-        return self.total
-
-    def _get_from_source(self, source, idx: int):
-        if source == "full":
-            return self.ds_full[int(idx)]
-        if source == "low":
-            return self.ds_low[int(idx)]
-        raise ValueError(f"unknown mix source: {source}")
-
-    def __getitem__(self, idx: int):
-        if isinstance(idx, tuple) and len(idx) == 2:
-            source, raw_idx = idx
-            return self._get_from_source(source, int(raw_idx))
-
-        u = _u01_from_seed_idx(self.seed, int(idx))
-        if u < self.full_ratio:
-            return self._get_from_source("full", int(idx))
-        else:
-            return self._get_from_source("low", int(idx))
-
-
-class MultiResolutionSubsetDataset(Dataset):
-    def __init__(self, datasets, ratios, seed: int = 0, names=None):
-        super().__init__()
-        if len(datasets) == 0:
-            raise ValueError("datasets must not be empty")
-        if len(datasets) != len(ratios):
-            raise ValueError(f"datasets/ratios length mismatch: {len(datasets)} vs {len(ratios)}")
-        if names is None:
-            names = [f"source{i}" for i in range(len(datasets))]
-        if len(names) != len(datasets):
-            raise ValueError(f"names/datasets length mismatch: {len(names)} vs {len(datasets)}")
-
-        cin0 = getattr(datasets[0], "Cin", None)
-        self.sources = []
-        self.cum_counts = []
-        total = 0
-        for i, (ds, ratio, name) in enumerate(zip(datasets, ratios, names)):
-            ratio = float(ratio)
-            if not (0.0 <= ratio <= 1.0):
-                raise ValueError(f"multi-resolution ratio must be in [0,1]. source={name} ratio={ratio}")
-            cin = getattr(ds, "Cin", None)
-            if cin0 is not None and cin is not None and int(cin) != int(cin0):
-                raise ValueError(f"Cin mismatch between multi-resolution datasets: {cin0} vs {cin} at {name}")
-
-            n = int(len(ds))
-            if ratio >= 1.0:
-                take = n
-            else:
-                take = int(math.floor(float(n) * ratio))
-            take = max(0, min(n, take))
-
-            if take == n:
-                indices = np.arange(n, dtype=np.int64)
-            elif take == 0:
-                indices = np.empty((0,), dtype=np.int64)
-            else:
-                rng = np.random.default_rng(int(seed) + 1000003 * (i + 1))
-                indices = np.sort(rng.permutation(n)[:take].astype(np.int64))
-
-            self.sources.append({
-                "dataset": ds,
-                "ratio": ratio,
-                "indices": indices,
-                "name": str(name),
-                "Ny": int(getattr(ds, "Ny", -1)),
-                "Nx": int(getattr(ds, "Nx", -1)),
-                "Cin": int(getattr(ds, "Cin", -1)),
-            })
-            total += int(indices.size)
-            self.cum_counts.append(total)
-
-        self.total = int(total)
-        if self.total <= 0:
-            raise ValueError("multi-resolution dataset is empty; all ratios selected zero samples")
-
-    def __len__(self):
-        return self.total
-
-    def __getitem__(self, idx: int):
-        if isinstance(idx, tuple) and len(idx) == 2:
-            source_idx, raw_idx = idx
-            src = self.sources[int(source_idx)]
-            return src["dataset"][int(raw_idx)]
-
-        gidx = int(idx)
-        source_idx = bisect_right(self.cum_counts, gidx)
-        prev = 0 if source_idx == 0 else int(self.cum_counts[source_idx - 1])
-        local = gidx - prev
-        src = self.sources[source_idx]
-        raw_idx = int(src["indices"][local])
-        return src["dataset"][raw_idx]
-
-    def summary(self):
-        out = []
-        for src in self.sources:
-            ds = src["dataset"]
-            selected = int(src["indices"].size)
-            total = int(len(ds))
-            out.append({
-                "name": src["name"],
-                "ratio": float(src["ratio"]),
-                "selected": selected,
-                "total": total,
-                "Ny": int(src["Ny"]),
-                "Nx": int(src["Nx"]),
-                "Cin": int(src["Cin"]),
-            })
-        return out
-
-
 def _iter_unique_sharded_bases(dataset, seen=None):
     if seen is None:
         seen = set()
@@ -1875,17 +1680,6 @@ def _iter_unique_sharded_bases(dataset, seen=None):
         if id(dataset) not in seen:
             seen.add(id(dataset))
             yield dataset
-        return
-    if isinstance(dataset, SourceGridSubsampledPTDataset):
-        yield from _iter_unique_sharded_bases(dataset.base, seen)
-        return
-    if isinstance(dataset, AlignedMixDataset):
-        yield from _iter_unique_sharded_bases(dataset.ds_full, seen)
-        yield from _iter_unique_sharded_bases(dataset.ds_low, seen)
-        return
-    if isinstance(dataset, MultiResolutionSubsetDataset):
-        for source in dataset.sources:
-            yield from _iter_unique_sharded_bases(source["dataset"], seen)
         return
     raise TypeError(f"unsupported dataset wrapper for cumulative time: {type(dataset).__name__}")
 
@@ -1900,36 +1694,6 @@ def prepare_dataset_cumulative_time(dataset, args):
             T_final=float(args.T_final),
         )
 
-    def validate_alignment(current):
-        if isinstance(current, SourceGridSubsampledPTDataset):
-            validate_alignment(current.base)
-        elif isinstance(current, AlignedMixDataset):
-            validate_alignment(current.ds_full)
-            validate_alignment(current.ds_low)
-            full_base = next(_iter_unique_sharded_bases(current.ds_full))
-            low_base = next(_iter_unique_sharded_bases(current.ds_low))
-            if len(full_base) != len(low_base) or not torch.allclose(
-                full_base.t_cumulative, low_base.t_cumulative, rtol=1.0e-6, atol=1.0e-7
-            ):
-                raise ValueError("aligned full/low datasets do not have identical cumulative times")
-        elif isinstance(current, MultiResolutionSubsetDataset):
-            source_bases = []
-            for source in current.sources:
-                validate_alignment(source["dataset"])
-                source_bases.append(next(_iter_unique_sharded_bases(source["dataset"])))
-            reference = source_bases[0]
-            for candidate in source_bases[1:]:
-                if len(candidate) == len(reference) and not torch.allclose(
-                    candidate.t_cumulative,
-                    reference.t_cumulative,
-                    rtol=1.0e-6,
-                    atol=1.0e-7,
-                ):
-                    raise ValueError(
-                        "same-length multi-resolution sources do not have identical cumulative times"
-                    )
-
-    validate_alignment(dataset)
     return bases
 
 
@@ -1978,10 +1742,6 @@ from torch.utils.data import Sampler
 def _get_sharded_base(ds):
     if isinstance(ds, BudgetCachedShardedPTDataset):
         return ds
-    if isinstance(ds, SourceGridSubsampledPTDataset):
-        return _get_sharded_base(ds.base)
-    if isinstance(ds, AlignedMixDataset):
-        return _get_sharded_base(ds.ds_full)
     return None
 
 
@@ -1996,7 +1756,7 @@ class ShardBatchSampler(Sampler):
 
         base = _get_sharded_base(dataset)
         if base is None:
-            raise TypeError("ShardBatchSampler requires BudgetCachedShardedPTDataset or AlignedMixDataset over it")
+            raise TypeError("ShardBatchSampler requires BudgetCachedShardedPTDataset")
         self.offsets = list(base.offsets)
         self.shard_ns = list(base.shard_ns)
         self._epoch = 0
@@ -2019,8 +1779,6 @@ class ShardBatchSampler(Sampler):
         bs = int(self.batch_size)
         shard_ids = list(range(len(self.shard_ns)))
         rng = random.Random(int(self.seed) + int(self._epoch))
-        mix_ds = self.dataset if isinstance(self.dataset, AlignedMixDataset) else None
-        batch_counter = 0
         if self.shuffle:
             rng.shuffle(shard_ids)
 
@@ -2043,107 +1801,10 @@ class ShardBatchSampler(Sampler):
                 batch = list(range(b0, b1))
                 if self.shuffle:
                     rng.shuffle(batch)
-                if mix_ds is None:
-                    yield batch
-                else:
-                    if mix_ds.full_ratio <= 0.0:
-                        source = "low"
-                    elif mix_ds.full_ratio >= 1.0:
-                        source = "full"
-                    else:
-                        source_epoch = int(self._epoch) if self.shuffle else 0
-                        u = _u01_from_seed_idx(
-                            int(self.seed) + 1000003 * (source_epoch + 1),
-                            int(batch_counter),
-                        )
-                        source = "full" if u < mix_ds.full_ratio else "low"
-                    yield [(source, i) for i in batch]
-                batch_counter += 1
+                yield batch
 
         self._epoch += 1
 
-
-class MultiResolutionShardBatchSampler(Sampler):
-    def __init__(self, dataset, batch_size, shuffle=True, drop_last=True, seed=0):
-        super().__init__()
-        if not isinstance(dataset, MultiResolutionSubsetDataset):
-            raise TypeError("MultiResolutionShardBatchSampler requires MultiResolutionSubsetDataset")
-        self.dataset = dataset
-        self.batch_size = int(batch_size)
-        self.shuffle = bool(shuffle)
-        self.drop_last = bool(drop_last)
-        self.seed = int(seed)
-        self._epoch = 0
-
-        self.groups = []
-        for source_idx, src in enumerate(self.dataset.sources):
-            base = _get_sharded_base(src["dataset"])
-            if base is None:
-                raise TypeError("multi-resolution sources must be backed by BudgetCachedShardedPTDataset")
-            by_shard = [[] for _ in base.shard_ns]
-            for raw_idx in src["indices"]:
-                ridx = int(raw_idx)
-                shard_idx = bisect_right(base.offsets, ridx) - 1
-                if shard_idx < 0:
-                    shard_idx = 0
-                by_shard[shard_idx].append(ridx)
-            for shard_idx, raw_indices in enumerate(by_shard):
-                if len(raw_indices) > 0:
-                    self.groups.append((int(source_idx), int(shard_idx), raw_indices))
-
-    def __len__(self):
-        bs = int(self.batch_size)
-        if bs <= 0:
-            return 0
-        if self.drop_last:
-            totals_by_source = {}
-            for source_idx, _, raw_indices in self.groups:
-                totals_by_source[int(source_idx)] = totals_by_source.get(int(source_idx), 0) + int(len(raw_indices))
-            return int(sum(total // bs for total in totals_by_source.values()))
-
-        n = 0
-        for _, _, raw_indices in self.groups:
-            gn = int(len(raw_indices))
-            n += (gn + bs - 1) // bs
-        return int(n)
-
-    def __iter__(self):
-        import random
-        bs = int(self.batch_size)
-        rng = random.Random(int(self.seed) + int(self._epoch))
-        group_ids = list(range(len(self.groups)))
-        pending_by_source = {}
-        if self.shuffle:
-            rng.shuffle(group_ids)
-
-        for gid in group_ids:
-            source_idx, _, raw_indices = self.groups[gid]
-            indices = list(raw_indices)
-            if self.shuffle:
-                rng.shuffle(indices)
-            nb = (len(indices) + bs - 1) // bs
-            batch_ids = list(range(nb))
-            if self.shuffle:
-                rng.shuffle(batch_ids)
-
-            for bid in batch_ids:
-                b0 = int(bid) * bs
-                batch = indices[b0:b0 + bs]
-                if self.drop_last and len(batch) < bs:
-                    pending = pending_by_source.setdefault(int(source_idx), [])
-                    pending.extend(batch)
-                    while len(pending) >= bs:
-                        out = pending[:bs]
-                        del pending[:bs]
-                        if self.shuffle:
-                            rng.shuffle(out)
-                        yield [(source_idx, i) for i in out]
-                else:
-                    if self.shuffle:
-                        rng.shuffle(batch)
-                    yield [(source_idx, i) for i in batch]
-
-        self._epoch += 1
 
 # -------------------------
 # metrics
@@ -2384,16 +2045,6 @@ def save_basis_reconstruction_report(stats, out_prefix, tolerance=0.01):
 def _basis_reconstruction_loader(dataset, args):
     """Visit every selected transition once, without dropping the last batch."""
     options = {"num_workers": 0, "generator": torch.Generator().manual_seed(0)}
-    if isinstance(dataset, MultiResolutionSubsetDataset):
-        sampler = MultiResolutionShardBatchSampler(
-            dataset, batch_size=int(args.batch_size), shuffle=False, drop_last=False, seed=0,
-        )
-        return DataLoader(dataset, batch_sampler=sampler, **options)
-    if isinstance(dataset, AlignedMixDataset):
-        sampler = ShardBatchSampler(
-            dataset, batch_size=int(args.batch_size), shuffle=False, drop_last=False, seed=0,
-        )
-        return DataLoader(dataset, batch_sampler=sampler, **options)
     return DataLoader(dataset, batch_size=int(args.batch_size), shuffle=False, drop_last=False, **options)
 
 
@@ -2675,12 +2326,12 @@ def _save_full_time_errors(energies, duration, out_prefix, boundary, evaluation,
 
 @torch.no_grad()
 def evaluate_full_time_test(model, loader, resolution_ops, args, out_prefix):
-    """Equal-weight trajectory mean/std of physical-time integrated one-step errors."""
+    """Equal-weight trajectory mean/std of physical-time integrated autoregressive errors."""
     model.eval()
     entries = _dataset_boundary_entries(loader.dataset)
     boundary = entries[0][0] if entries else args.basis_boundary
-    # Reuse the test batch sampler but read in this process so persistent training
-    # workers never retain the temporary evaluation metadata setting.
+    # Read in this process so persistent training workers never retain the
+    # temporary evaluation metadata setting. Evaluate every test transition.
     bases = ([] if isinstance(loader.dataset, (TeacherTransitionDataset, TeacherTransitionSubset))
              else list(_iter_unique_sharded_bases(loader.dataset)))
     previous = [(base, getattr(base, "full_time_evaluation_metadata", False),
@@ -2704,28 +2355,45 @@ def evaluate_full_time_test(model, loader, resolution_ops, args, out_prefix):
     _save_trajectory_error_statistics(trajectories, out_prefix + "_test", boundary)
 
 
+@torch.no_grad()
 def _collect_full_time_test_errors(model, loader, resolution_ops, args, boundary):
+    # Keep only indices/times in memory, then load one trajectory at a time.
+    # Sorting makes rollout independent of training sampler order and batch size.
+    grouped = {}
+    for index in range(len(loader.dataset)):
+        _, _, metadata = loader.dataset[index]
+        if not isinstance(metadata, dict) or not all(
+                name in metadata for name in ("source_id", "sample_id", "t_cumulative", "dt_physical")):
+            raise ValueError("Trajectory statistics require source_id, sample_id and physical time metadata")
+        key = (int(metadata["source_id"]), int(metadata["sample_id"]))
+        end, dt = float(metadata["t_cumulative"]), float(metadata["dt_physical"])
+        if not np.isfinite([end, dt]).all() or dt <= 0:
+            raise ValueError("Full-time rollout requires finite times and positive physical dt")
+        grouped.setdefault(key, []).append((end, dt, index))
     trajectories = {}
-    for batch in loader:
-        xb, yb, _, metadata = _unpack_training_batch(batch)
-        if metadata is None or "source_id" not in metadata or "sample_id" not in metadata:
-            raise ValueError("Trajectory statistics require source_id and sample_id metadata")
-        keys = list(zip(metadata["source_id"].tolist(), metadata["sample_id"].tolist()))
-        xb, yb = xb.to(DEVICE).float(), yb.to(DEVICE).float()
-        metadata = _metadata_to_device(metadata, DEVICE)
-        dt = metadata["dt_physical"].double().reshape(-1)
-        if not torch.isfinite(dt).all() or (dt < 0).any():
-            raise ValueError("Full-time evaluation requires finite nonnegative physical dt")
-        resolution_ops.prepare_model(model, *_batch_ny_nx(xb))
-        pred = _model_forward_batch(model, xb, metadata)
-        energy = _full_time_error_energies(pred, yb, args.Lx, args.Ly, boundary)
-        weighted = (energy * dt[:, None, None]).detach().cpu().numpy()
-        for key, contribution, step_dt in zip(keys, weighted, dt.cpu().tolist()):
-            item = trajectories.setdefault(key, {"energies": np.zeros((5, 2)), "duration": 0.0,
-                                                 "steps": 0, "boundary_length": 2 * (args.Lx + args.Ly)})
-            item["energies"] += contribution
-            item["duration"] += step_dt
+    for key, records in grouped.items():
+        records.sort()
+        current, previous_end = None, None
+        item = {"energies": np.zeros((5, 2)), "duration": 0.0,
+                "steps": 0, "boundary_length": 2 * (args.Lx + args.Ly)}
+        for end, dt, index in records:
+            if previous_end is not None and (end <= previous_end or not np.isclose(
+                    end - previous_end, dt, rtol=1e-5, atol=1e-6)):
+                raise ValueError(f"Full-time rollout requires a contiguous trajectory: {key}")
+            batch = loader.collate_fn([loader.dataset[index]])
+            xb, yb, _, metadata = _unpack_training_batch(batch)
+            xb, yb = xb.to(DEVICE).float().clone(), yb.to(DEVICE).float()
+            metadata = _metadata_to_device(metadata, DEVICE)
+            if current is not None:
+                xb[..., :2] = current
+            resolution_ops.prepare_model(model, *_batch_ny_nx(xb))
+            current = _model_forward_batch(model, xb, metadata)
+            energy = _full_time_error_energies(current, yb, args.Lx, args.Ly, boundary)
+            item["energies"] += energy[0].cpu().numpy() * dt
+            item["duration"] += dt
             item["steps"] += 1
+            previous_end = end
+        trajectories[key] = item
     return trajectories
 
 
@@ -2746,7 +2414,7 @@ def _save_trajectory_error_statistics(trajectories, out_prefix, boundary):
                 e = item["energies"].sum(axis=1) if column is None else item["energies"][:, column]
                 row = _full_time_metric_values(e, item["duration"], item["boundary_length"], boundary)
                 values[channel].append(row)
-                writer.writerow(["test_one_step_right_endpoint", source_id, sample_id, channel,
+                writer.writerow(["test_autoregressive_rollout_right_endpoint", source_id, sample_id, channel,
                                  item["duration"], item["steps"], item["boundary_length"]] + row)
     summary_path = out_prefix + "_full_time_errors.csv"
     with open(summary_path, "w", newline="", encoding="utf-8") as handle:
@@ -2757,7 +2425,7 @@ def _save_trajectory_error_statistics(trajectories, out_prefix, boundary):
             array = np.asarray(rows, dtype=np.float64)
             with np.errstate(invalid="ignore"):
                 means, stds = array.mean(axis=0), array.std(axis=0, ddof=0)
-            writer.writerow(["test_one_step_right_endpoint", channel, len(rows), 0] +
+            writer.writerow(["test_autoregressive_rollout_right_endpoint", channel, len(rows), 0] +
                             [value for pair in zip(means, stds) for value in pair])
             text = " | ".join(f"{metric}={mean:.8g} +/- {std:.8g}"
                               for metric, mean, std in zip(metrics, means, stds))
@@ -3902,13 +3570,6 @@ def parse_args():
     p.add_argument("--resume", type=int, default=1, help="1: resume model weights from out_prefix_best.pt when it exists")
     p.add_argument("--seed", type=int, default=0)
 
-    p.add_argument("--pt_root_low", type=str, default="", help="low-res dataset root. if empty, no mixing")
-    p.add_argument("--mix_full_ratio", type=float, default=1.0, help="probability to draw full sample (aligned by idx)")
-    p.add_argument("--mix_on_test", type=int, default=0, help="0: test on full only, 1: apply same mixing on test")
-    p.add_argument("--pt_roots", type=str, default="", help="comma-separated dataset roots ordered low-to-high; enables multi-resolution subset training")
-    p.add_argument("--pt_source_grid_hws", type=str, default="", help="comma-separated output sizes built from --pt_root by source-grid subsampling, e.g. 25,50,75,full")
-    p.add_argument("--pt_root_ratios", "--pt_root_fractions", dest="pt_root_ratios", type=str, default="", help="comma-separated fractions for --pt_roots, e.g. 0.9,0.5,0.3,0.2")
-    p.add_argument("--multi_res_on_test", type=int, default=0, help="0: test on highest-resolution root, 1: apply --pt_root_ratios to test too")
     p.add_argument("--save_dir", type=str, default="/content/drive/MyDrive/output_data")
     p.add_argument("--log_file", type=str, default="", help="console log path; default save_dir/out_prefix_YYYYMMDD_HHMMSS_log.txt. use 'none' to disable")
     p.add_argument("--smoke_test", action="store_true", help="run lightweight CPU-safe compatibility checks and exit")
@@ -4163,88 +3824,6 @@ def log_first_batch_layer_scaling(model, xb, metadata, Lx, Ly):
     print(f"  mu_10: {mu[0, 1].item():.10g}", flush=True)
     print(f"  mu_01: {mu[1, 0].item():.10g}", flush=True)
     print(f"  mu_11: {mu[1, 1].item():.10g}", flush=True)
-
-
-def _parse_float_csv(value, name):
-    items = _split_csv(value)
-    try:
-        return [float(x) for x in items]
-    except ValueError as e:
-        raise ValueError(f"{name} must be comma-separated floats: {value}") from e
-
-
-def _parse_source_grid_hws(value):
-    out = []
-    for item in _split_csv(value):
-        token = item.lower()
-        if token in {"full", "max", "source"}:
-            out.append(None)
-            continue
-        try:
-            out.append(int(item))
-        except ValueError as e:
-            raise ValueError(f"--pt_source_grid_hws must contain integers or 'full': {value}") from e
-    return out
-
-
-def _source_grid_hw_name(hw, base_ds):
-    if hw is None:
-        return f"full{int(base_ds.Ny)}"
-    return f"low{int(hw)}"
-
-
-def _source_grid_hw_value(hw, base_ds):
-    if hw is None:
-        return min(int(base_ds.Ny), int(base_ds.Nx))
-    return int(hw)
-
-
-def _pick_highest_source_grid_hw(hws, base_ds):
-    return max(hws, key=lambda hw: _source_grid_hw_value(hw, base_ds))
-
-
-def _default_index_path(pt_root, split_name):
-    fname = f"gm2d_{split_name}_201_index.pt"
-    return os.path.join(str(pt_root), split_name, fname)
-
-
-def _load_pt_dataset_from_root(pt_root, split_name, max_cache_gb):
-    index_path = _default_index_path(pt_root, split_name)
-    if not os.path.exists(index_path):
-        raise FileNotFoundError(f"{split_name} index not found: {index_path}")
-    return BudgetCachedShardedPTDataset(index_path, max_cache_gb=max_cache_gb, to_float32=False)
-
-
-def _load_pt_dataset_from_args(args, split_name):
-    if split_name == "train":
-        index_path = args.train_index.strip() or _default_index_path(args.pt_root, "train")
-    elif split_name == "test":
-        index_path = args.test_index.strip() or _default_index_path(args.pt_root, "test")
-    else:
-        raise ValueError(f"unknown split: {split_name}")
-    if not os.path.exists(index_path):
-        raise FileNotFoundError(f"{split_name} index not found: {index_path}")
-    return BudgetCachedShardedPTDataset(index_path, max_cache_gb=args.max_cache_gb, to_float32=False)
-
-
-def _make_source_grid_multires_sources(base_ds, hws):
-    sources = [maybe_source_grid_subsample_dataset(base_ds, hw) for hw in hws]
-    names = [
-        f"{getattr(base_ds, 'root_dir', 'pt')}@source_grid_{_source_grid_hw_name(hw, base_ds)}"
-        for hw in hws
-    ]
-    return sources, names
-
-
-def _print_multi_res_summary(label, dataset):
-    print(f"{label} multi-resolution summary:", flush=True)
-    for i, row in enumerate(dataset.summary()):
-        print(
-            "  [{}] Ny,Nx=({},{}) ratio={:.3f} selected={}/{} root={}".format(
-                i, row["Ny"], row["Nx"], row["ratio"], row["selected"], row["total"], row["name"]
-            ),
-            flush=True,
-        )
 
 
 def dataloader_worker_kwargs(args):
@@ -4520,125 +4099,17 @@ def main():
         print("argv:", " ".join(sys.argv), flush=True)
     set_seed(args.seed)
 
-    source_grid_hws = _parse_source_grid_hws(args.pt_source_grid_hws)
-    pt_roots = _split_csv(args.pt_roots)
     teacher_dataset = None
     if teacher_mode:
-        if source_grid_hws or pt_roots or args.train_index.strip() or args.test_index.strip():
-            print(
-                "NOTE: direct --teacher_path(s) are active; old sharded/multi-resolution dataset "
-                "arguments are ignored.",
-                flush=True,
-            )
+        if args.train_index.strip() or args.test_index.strip():
+            print("NOTE: direct --teacher_path(s) are active; sharded dataset arguments are ignored.", flush=True)
         teacher_dataset, train_ds, test_ds = _load_direct_teacher_data(args, teacher_paths)
         print_teacher_data_summary(teacher_dataset, train_ds, test_ds, args)
-    elif len(source_grid_hws) > 0:
-        ratios = _parse_float_csv(args.pt_root_ratios, "--pt_root_ratios")
-        if len(ratios) == 0:
-            raise ValueError("--pt_root_ratios is required when --pt_source_grid_hws is set")
-        if len(source_grid_hws) != len(ratios):
-            raise ValueError(
-                f"--pt_source_grid_hws and --pt_root_ratios must have the same length: "
-                f"{len(source_grid_hws)} vs {len(ratios)}"
-            )
-        if len(pt_roots) > 0:
-            print("WARNING: --pt_roots is ignored when --pt_source_grid_hws is set.", flush=True)
-
-        train_base = _load_pt_dataset_from_args(args, "train")
-        train_sources, train_names = _make_source_grid_multires_sources(train_base, source_grid_hws)
-        train_ds = MultiResolutionSubsetDataset(
-            train_sources, ratios, seed=int(args.seed), names=train_names
-        )
-        _print_multi_res_summary("train", train_ds)
-
-        test_base = _load_pt_dataset_from_args(args, "test")
-        if int(args.multi_res_on_test) == 1 or int(args.mix_on_test) == 1:
-            test_sources, test_names = _make_source_grid_multires_sources(test_base, source_grid_hws)
-            test_ds = MultiResolutionSubsetDataset(
-                test_sources, ratios, seed=int(args.seed) + 7919, names=test_names
-            )
-            _print_multi_res_summary("test", test_ds)
-        else:
-            test_hw = _pick_highest_source_grid_hw(source_grid_hws, test_base)
-            test_ds = maybe_source_grid_subsample_dataset(test_base, test_hw)
-            print(
-                "source-grid test: highest-resolution source only: {}".format(
-                    _source_grid_hw_name(test_hw, test_base)
-                ),
-                flush=True,
-            )
-    elif len(pt_roots) > 0:
-        ratios = _parse_float_csv(args.pt_root_ratios, "--pt_root_ratios")
-        if len(ratios) == 0:
-            raise ValueError("--pt_root_ratios is required when --pt_roots is set")
-        if len(pt_roots) != len(ratios):
-            raise ValueError(f"--pt_roots and --pt_root_ratios must have the same length: {len(pt_roots)} vs {len(ratios)}")
-        if args.train_index.strip() or args.test_index.strip():
-            print("WARNING: --train_index/--test_index are ignored when --pt_roots is set.", flush=True)
-
-        train_sources = [
-            _load_pt_dataset_from_root(root, "train", args.max_cache_gb)
-            for root in pt_roots
-        ]
-        train_ds = MultiResolutionSubsetDataset(
-            train_sources, ratios, seed=int(args.seed), names=pt_roots
-        )
-        _print_multi_res_summary("train", train_ds)
-
-        if int(args.multi_res_on_test) == 1 or int(args.mix_on_test) == 1:
-            test_sources = [
-                _load_pt_dataset_from_root(root, "test", args.max_cache_gb)
-                for root in pt_roots
-            ]
-            test_ds = MultiResolutionSubsetDataset(
-                test_sources, ratios, seed=int(args.seed) + 7919, names=pt_roots
-            )
-            _print_multi_res_summary("test", test_ds)
-        else:
-            test_root = pt_roots[-1]
-            test_ds = _load_pt_dataset_from_root(test_root, "test", args.max_cache_gb)
-            print(f"multi-resolution test: highest-resolution root only: {test_root}", flush=True)
     else:
         train_index = args.train_index.strip() or os.path.join(args.pt_root, "train", "gm2d_train_201_index.pt")
-        test_index  = args.test_index.strip()  or os.path.join(args.pt_root, "test",  "gm2d_test_201_index.pt")
-
-        train_ds_full = BudgetCachedShardedPTDataset(train_index, max_cache_gb=args.max_cache_gb, to_float32=False)
-        test_ds_full  = BudgetCachedShardedPTDataset(test_index,  max_cache_gb=args.max_cache_gb, to_float32=False)
-
-        train_ds = train_ds_full
-        test_ds  = test_ds_full
-
-        full_ratio = float(args.mix_full_ratio)
-        pt_root_low = args.pt_root_low.strip()
-        if not (0.0 <= full_ratio <= 1.0):
-            raise ValueError(f"mix_full_ratio must be in [0,1]. got {full_ratio}")
-
-        do_mix = (pt_root_low != "") and (full_ratio < 1.0)
-        if (pt_root_low == "") and (full_ratio < 1.0):
-            print("WARNING: mix_full_ratio < 1 but pt_root_low is empty. Mixing is disabled; train/test use full only.", flush=True)
-        if (pt_root_low != "") and (full_ratio >= 1.0):
-            print("NOTE: pt_root_low is provided but mix_full_ratio=1.0, so low dataset will not be loaded.", flush=True)
-
-        if do_mix:
-           train_index_low = os.path.join(pt_root_low, "train", "gm2d_train_201_index.pt")
-           if not os.path.exists(train_index_low):
-               raise FileNotFoundError("low-res train index not found: " + train_index_low)
-           train_ds_low = BudgetCachedShardedPTDataset(train_index_low, max_cache_gb=args.max_cache_gb, to_float32=False)
-           train_ds = AlignedMixDataset(train_ds_full, train_ds_low, full_ratio=full_ratio, seed=args.seed)
-
-           if int(args.mix_on_test) == 1:
-               test_index_low  = os.path.join(pt_root_low, "test",  "gm2d_test_201_index.pt")
-               if not os.path.exists(test_index_low):
-                   raise FileNotFoundError("low-res test index not found: " + test_index_low)
-               test_ds_low  = BudgetCachedShardedPTDataset(test_index_low,  max_cache_gb=args.max_cache_gb, to_float32=False)
-               test_ds  = AlignedMixDataset(test_ds_full, test_ds_low, full_ratio=full_ratio, seed=args.seed)
-           else:
-               test_ds = test_ds_full
-           print(f"mix enabled: full_ratio={full_ratio:.3f} pt_root_low={pt_root_low}", flush=True)
-        else:
-           train_ds = train_ds_full
-           test_ds = test_ds_full
-           print("mix disabled (train/test use full only)", flush=True)
+        test_index = args.test_index.strip() or os.path.join(args.pt_root, "test", "gm2d_test_201_index.pt")
+        train_ds = BudgetCachedShardedPTDataset(train_index, max_cache_gb=args.max_cache_gb, to_float32=False)
+        test_ds = BudgetCachedShardedPTDataset(test_index, max_cache_gb=args.max_cache_gb, to_float32=False)
 
     if not teacher_mode:
         prepare_dataset_cumulative_time(train_ds, args)
@@ -4669,47 +4140,17 @@ def main():
         )
         print("train loader: batch_size=1 with global shuffle=True", flush=True)
     else:
-        if isinstance(train_ds, MultiResolutionSubsetDataset):
-            train_batch_sampler = MultiResolutionShardBatchSampler(
-                train_ds, batch_size=int(args.batch_size), shuffle=True, drop_last=True, seed=args.seed
-            )
-        else:
-            train_batch_sampler = ShardBatchSampler(
-                train_ds, batch_size=int(args.batch_size), shuffle=True, drop_last=True, seed=args.seed
-            )
+        train_batch_sampler = ShardBatchSampler(
+            train_ds, batch_size=int(args.batch_size), shuffle=True, drop_last=True, seed=args.seed
+        )
         train_loader = DataLoader(
             train_ds, batch_sampler=train_batch_sampler,
             **loader_kwargs
         )
-    if teacher_mode:
-        test_loader = DataLoader(
-            test_ds,
-            batch_size=int(args.batch_size),
-            shuffle=False,
-            drop_last=False,
-            **loader_kwargs,
-        )
-    elif isinstance(test_ds, MultiResolutionSubsetDataset):
-        test_batch_sampler = MultiResolutionShardBatchSampler(
-            test_ds, batch_size=int(args.batch_size), shuffle=False, drop_last=False, seed=args.seed
-        )
-        test_loader = DataLoader(
-            test_ds, batch_sampler=test_batch_sampler,
-            **loader_kwargs
-        )
-    elif isinstance(test_ds, AlignedMixDataset):
-        test_batch_sampler = ShardBatchSampler(
-            test_ds, batch_size=int(args.batch_size), shuffle=False, drop_last=False, seed=args.seed
-        )
-        test_loader = DataLoader(
-            test_ds, batch_sampler=test_batch_sampler,
-            **loader_kwargs
-        )
-    else:
-        test_loader = DataLoader(
-            test_ds, batch_size=int(args.batch_size), shuffle=False,
-            drop_last=False, **loader_kwargs
-        )
+    test_loader = DataLoader(
+        test_ds, batch_size=int(args.batch_size), shuffle=False,
+        drop_last=False, **loader_kwargs
+    )
 
     first_batch = next(iter(train_loader))
     xb0, _, _, metadata0 = _unpack_training_batch(first_batch)
