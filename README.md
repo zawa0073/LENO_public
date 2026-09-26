@@ -183,27 +183,6 @@ Fourier FNO経路では通常学習時に理由を表示して評価を省略し
 格子と円盤では基底・質量重み・入力標準化が異なります。各領域のモデル定義と
 実行入口に処理を分けており、同じ名前の関数でも引数やデータ形状は異なります。
 
-## 旧FEMコードとの互換性
-
-| 旧名 | 現在の名前 |
-|---|---|
-| `GMSFEMNO` | `LENO2d` |
-| `GMSDiskFNO` | `DiskFNO2d` |
-| `GeneralSpectralConv` | `SpectralConvNodes` |
-| `rel_l2_nodes` | `mass_rel_l2_nodes_channels_per_sample` |
-| `train_model` | `train_leno` |
-| `save_history` | `save_training_history` |
-| `save_rollout_pngs` | `visualize_teacher_rollouts` |
-| `--teacher_path` | `--teacher_paths` |
-| `--save_rollout_png` | `--teacher_rollout` |
-| `--rollout_png_times` | `--t_snap` |
-| `--rollout_png_use_best` | `--teacher_rollout_use_best` |
-
-旧Python名とCLI名も別名として使用できます。CLI解析後の属性は現在の名前になります。
-既存の `pointwise.*` のモデル重みは、読み込み時に `w1.*` へ変換します。
-optimizerのパラメータ順序とcheckpointの `history` フィールドは維持しています。
-命名変更は演算・学習条件を変更しません。
-
 ## 検証
 
 ```bash
