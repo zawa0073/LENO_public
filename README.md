@@ -1,66 +1,68 @@
 # LENO training: rectangular grids and disk nodes
 
-矩形格子と円盤上の反応拡散データから、1ステップの時間発展を学習するコードです。
-共通する処理には同じ名前を使い、領域・データ形状に依存する処理には `Disk` / `Nodes` を付けています。
-実行入口は `squaredomain.py` と `circledomain.py` です。
-モデルと基底処理はそれぞれ `model_squaredomain.py` と `model_circledomain.py` にまとめています。
-**4つのPythonファイルを同じフォルダに置いてください。**
+This repository provides code for learning one-step time evolution from reaction-diffusion data on rectangular grids and disks.
+Shared operations use consistent names, while operations specific to a domain or data layout use the `Disk` or `Nodes` suffix.
+The entry points are `squaredomain.py` and `circledomain.py`.
+Model definitions and basis operations are in `model_squaredomain.py` and `model_circledomain.py`, respectively.
+**Keep all four Python files in the same directory.**
 
-## ファイル構成と読む順序
+## File structure and suggested reading order
 
-| ファイル | 内容 |
+| File | Contents |
 |---|---|
-| [squaredomain.py](squaredomain.py) | 正方形・矩形格子のデータ読み込み、学習、評価、描画、CLI |
-| [model_squaredomain.py](model_squaredomain.py) | 格子の質量行列、Neumann・周期基底、スペクトル層、`LENO2d` |
-| [circledomain.py](circledomain.py) | 円盤データの読み込み、学習、評価、描画、CLI |
-| [model_circledomain.py](model_circledomain.py) | 円盤の基底、入力正規化層、スペクトル層、`LENO2d`、`DiskFNO2d` |
+| [squaredomain.py](squaredomain.py) | Data loading, training, evaluation, plotting, and CLI for square and rectangular grids |
+| [model_squaredomain.py](model_squaredomain.py) | Grid mass matrices, Neumann and periodic bases, spectral layers, and `LENO2d` |
+| [circledomain.py](circledomain.py) | Data loading, training, evaluation, plotting, and CLI for disks |
+| [model_circledomain.py](model_circledomain.py) | Disk bases, input normalization layers, spectral layers, `LENO2d`, and `DiskFNO2d` |
 
-数式とモデル構造を確認する場合は `model_*.py` の基底作成、スペクトル層、
-モデルの `forward` の順に読んでください。実験の流れは各実行入口の `main` から追えます。
-モデル側は学習スクリプトをimportしないため、モデルだけを別の実験から利用できます。
+To review the mathematics and model architecture, start with basis construction in `model_*.py`,
+then read the spectral layers and the model's `forward` method.
+To follow the experiment workflow, start with `main` in each entry point.
+The model modules do not import the training scripts, so you can use the models independently in other experiments.
 
 ```python
 from model_squaredomain import LENO2d as SquareLENO2d
 from model_circledomain import LENO2d as CircleLENO2d
 ```
 
-各実行入口からも同じモデル名・基底関数をimportできます。
-ファイル分割と改名に伴う演算式、既定の学習条件、`state_dict` のキーの変更はありません。
-既存の学習スクリプトが出力したチェックポイントを継続して利用できます。
-旧ファイル名を使っている実行コマンドやimport文は、新しい名前に更新してください。
+The same model classes and basis functions can also be imported from the entry point modules.
+The file split and renaming preserve the mathematical operations, default training settings, and `state_dict` keys.
+Checkpoints produced by the previous training scripts remain usable.
+Update any commands or import statements that still use the old filenames.
 
-## 領域ごとの機能
+## Features by domain
 
 | | `squaredomain.py` | `circledomain.py` |
 |---|---|---|
-| 領域 | 矩形 | 円盤 |
-| 入力状態 | `(B, Ny, Nx, Cin)` | `(B, N, 4)` と時間刻み `(B,)` |
-| 出力状態 | `(B, Ny, Nx, 2)` | `(B, N, 2)` |
-| Laplaceモデル | `LENO2d` | `LENO2d` |
-| Laplaceスペクトル層 | `SpectralConvSeparable` | `SpectralConvNodes` |
-| Fourierスペクトル層 | `SpectralConvFFT2d` | `SpectralConvFFT2d` |
-| 円盤のFourierモデル | — | `DiskFNO2d` |
-| 学習・評価 | `train_leno`, `eval_epoch` | 同左 |
-| 履歴保存 | `save_training_history` | 同左 |
-| 全時間テスト評価 | `evaluate_full_time_test` | 同左 |
-| 1軌道の可視化 | `visualize_rollout_teacher_gm2d` | 同左 |
+| Domain | Rectangle | Disk |
+| Input state | `(B, Ny, Nx, Cin)` | `(B, N, 4)` with a separate time step `(B,)` |
+| Output state | `(B, Ny, Nx, 2)` | `(B, N, 2)` |
+| Laplace model | `LENO2d` | `LENO2d` |
+| Laplace spectral layer | `SpectralConvSeparable` | `SpectralConvNodes` |
+| Fourier spectral layer | `SpectralConvFFT2d` | `SpectralConvFFT2d` |
+| Fourier model for disks | — | `DiskFNO2d` |
+| Training and evaluation | `train_leno`, `eval_epoch` | Same names |
+| Training history export | `save_training_history` | Same name |
+| Full-time test evaluation | `evaluate_full_time_test` | Same name |
+| Single-trajectory visualization | `visualize_rollout_teacher_gm2d` | Same name |
 
-同名関数でも、領域に応じて基底・質量重み・データ引数は異なります。
-両ファイルのモデルやチェックポイントを相互交換できるという意味ではありません。
+Functions with the same name use different bases, mass weights, and data arguments depending on the domain.
+Models and checkpoints are therefore specific to their domain and cannot be used interchangeably between the two scripts.
 
-## 実行
+## Running the code
 
-Python 3.10以降と、NumPy、SciPy、PyTorch、Matplotlibが必要です。
-RAMの使用量表示には任意でpsutilを使用します。
+Python 3.10 or later, NumPy, SciPy, PyTorch, and Matplotlib are required.
+The optional psutil package is used to report RAM usage.
 
 ```bash
 python -m pip install numpy scipy torch matplotlib psutil
 ```
 
-円盤データの例です。パスは実際の教師ファイルに置き換えてください。
-`--teacher_paths` は複数パス・カンマ区切り・ワイルドカードに対応します。
-FEM側もCPUメモリマップで読み込み、全ファイルのx/yを結合せず必要な遷移だけを取り出します。
-`--teacher_mmap 0` で通常読み込みに切り替えられます。
+The following example uses disk data. Replace the path with the location of your teacher data files.
+`--teacher_paths` accepts multiple paths, comma-separated paths, and wildcards.
+The FEM pipeline also uses CPU memory mapping and retrieves only the required transitions,
+without concatenating all files' x/y arrays.
+Use `--teacher_mmap 0` to switch to regular loading.
 
 ```bash
 python circledomain.py \
@@ -73,22 +75,25 @@ python circledomain.py \
   --teacher_rollout 1 --t_snap "T/2,T"
 ```
 
-教師の `T` と `--dt_scale` を一致させてください。FEMの時間刻みは
-`dt_physical`、`dt_normalized`、`dt`、旧入力チャネルの順に読み込みます。
-単位はメタデータまたは保存時刻との差分から判定し、不明なら `--teacher_dt_units physical`
-または `normalized` を指定します。円盤の座標と4チャネル入力＋独立dtは維持します。
-FDMの矩形256×256・固定保存時刻に対するstrict検査は円盤には適用しません。
+Set `--dt_scale` to match `T` in the teacher data.
+The FEM pipeline reads the time step in this order of precedence:
+`dt_physical`, `dt_normalized`, `dt`, and the legacy input channel.
+Units are inferred from metadata or differences between saved times.
+If the units cannot be determined, specify `--teacher_dt_units physical` or `normalized`.
+Disk coordinates and the four-channel input with a separate dt are preserved.
+The FDM checks for the strict 256×256 rectangular grid and fixed saved-time specification do not apply to disk data.
 
-両方とも既定で全ファイルの軌道集合を80%/20%に分割します。
-`--num_train_trajectories` / `--num_test_trajectories` で分割後の採用軌道数を指定できます
-（`-1` は全候補）。`--split_seed` が同じなら選択も再現されます。
-`--train_sample_ids` / `--test_sample_ids` は元のsample_id、または `source_id:sample_id`
-をカンマ区切りで指定します。軌道を途中で切る `--max_train_samples` / `--max_test_samples`
-の使い方はエラーになります。sample_id/time_indexがない旧データは保存時刻から
-軌道順を復元できる場合に対応し、遷移単位のランダム分割は行いません。
+By default, both scripts split the trajectories across all files into 80% training and 20% test data.
+Use `--num_train_trajectories` / `--num_test_trajectories` to limit the number of trajectories selected after splitting
+(`-1` selects all candidates). The same `--split_seed` reproduces the selection.
+`--train_sample_ids` / `--test_sample_ids` accept comma-separated original sample_id values or `source_id:sample_id` pairs.
+Using `--max_train_samples` / `--max_test_samples` in a way that truncates a trajectory raises an error.
+Legacy data without sample_id/time_index is supported when trajectory order can be reconstructed from saved times.
+Individual transitions are not randomly split between training and test sets.
 
-矩形の直接教師データの例です。`--teacher_strict_standard 0` は固定実験仕様の検査を無効にします。
-教師ファイルの時刻・境界条件・領域サイズは実際のデータに合わせて指定してください。
+The following example uses direct teacher data for a rectangular domain.
+`--teacher_strict_standard 0` disables checks against the fixed experiment specification.
+Set the times, boundary conditions, and domain size to match your teacher data.
 
 ```bash
 python squaredomain.py \
@@ -101,98 +106,109 @@ python squaredomain.py \
   --teacher_rollout 1 --t_snap "50,250"
 ```
 
-コードブロックの改行継続はbash用です。PowerShellでは1行にまとめて実行できます。
-Colabでも4つのPythonファイルを同じ作業フォルダに置き、
-`!python circledomain.py ...` または `!python squaredomain.py ...` と実行します。
-`.py` ファイル自身には `%%writefile` を含めません。
-引数の一覧は次のコマンドで確認できます。
+The line continuations in these code blocks use bash syntax. In PowerShell, run each command on a single line.
+In Colab, place all four Python files in the same working directory and run
+`!python circledomain.py ...` or `!python squaredomain.py ...`.
+Do not include `%%writefile` inside the `.py` files themselves.
+To list the available arguments, run:
 
 ```bash
 python squaredomain.py --help
 python circledomain.py --help
 ```
 
-教師データはこのリポジトリには含まれていません。実験に使うデータを別途用意し、
-上記の `--teacher_paths` を実際の保存先に置き換えてください。
+Teacher data is not included in this repository. Prepare the data for your experiment separately
+and replace `--teacher_paths` in the examples with the actual location.
 
-## 教師データの基底再構成誤差
+## Basis reconstruction error for teacher data
 
-両スクリプトは既定で、学習前に設定した基底へ教師のu/vを射影し、
-相対空間L2誤差 `||u-u_K||_M / ||u||_M` を計算します。
-FEMは節点の質量重み、FDMは基底と同じ質量行列を使います。
-評価対象は採用したtrain/testの全遷移です。入力状態 `x[..., :2]` と
-次時刻の正解 `y[..., :2]` は別々に集計し、標準化や時間重みは適用しません。
-各遷移を等重みに数えるため、同じ状態が隣接遷移の入力・正解に現れる場合もあります。
+By default, both scripts project the teacher u/v fields onto the configured basis before training
+and compute the relative spatial L2 error `||u-u_K||_M / ||u||_M`.
+FEM uses nodal mass weights; FDM uses the same mass matrix as the basis.
+The evaluation covers every selected training and test transition.
+Input states `x[..., :2]` and next-step targets `y[..., :2]` are aggregated separately,
+without standardization or time weighting.
+Each transition receives equal weight, so the same state may appear as both the target of one transition
+and the input of the next.
 
-| オプション | 既定値 | 内容 |
+| Option | Default | Description |
 |---|---|---|
-| `--basis_reconstruction` | `1` | `0` で学習前の再構成評価を省略 |
-| `--reconstruction_tol` | `0.01` | 許容相対L2誤差。0.01は1% |
-| `--reconstruction_only` | `0` | `1` で再構成評価のみ実行し、モデル作成・学習前に終了 |
+| `--basis_reconstruction` | `1` | Set to `0` to skip reconstruction evaluation before training |
+| `--reconstruction_tol` | `0.01` | Relative L2 error tolerance; 0.01 means 1% |
+| `--reconstruction_only` | `0` | Set to `1` to evaluate reconstruction only and exit before model creation and training |
 
-通常の実行引数に `--reconstruction_only 1` を追加すると、学習せず基底を調べられます。
-`--basis_reconstruction 0` と併用した場合も評価を実行します。
-FEMの `--inspect_only 1` は基底作成前に終了するため、評価時は指定しないでください。
+Add `--reconstruction_only 1` to your usual arguments to inspect the basis without training.
+Evaluation still runs when this option is combined with `--basis_reconstruction 0`.
+Do not use the FEM option `--inspect_only 1` for this evaluation, as it exits before basis construction.
 
-保存先は `save_dir/out_prefix` に次の接尾辞を付けたCSVです。
+Results are saved as CSV files using `save_dir/out_prefix` with the following suffixes:
 
-- `_basis_reconstruction_curve.csv`: K=1から設定した実効基底数までの平均・最大相対L2誤差。
-- `_basis_reconstruction_summary.csv`: 全設定基底での誤差、許容誤差、平均誤差が条件を満たす
-  `min_K_mean`、全評価状態が条件を満たす `min_K_all`。設定範囲内で未達なら最小Kは空欄です。
+- `_basis_reconstruction_curve.csv`: Mean and maximum relative L2 errors for K=1 through the configured effective basis size.
+- `_basis_reconstruction_summary.csv`: Errors using the full configured basis, the tolerance,
+  `min_K_mean` (the smallest K satisfying the mean-error tolerance), and
+  `min_K_all` (the smallest K satisfying the tolerance for every evaluated state).
+  Minimum-K fields are left blank if the tolerance is not reached within the configured range.
 
-CSVはsplit・input/target・解像度・u/v/combinedごとに出力します。
-`combined` はu/vの二乗ノルムの和で計算します。誤差ゼロのゼロ場は相対誤差0とします。
-全教師状態・両成分を1%以内に収めるには、各splitのinput/targetのu/v行で
-`min_K_all` を確認し、その最大値を使います。空欄があれば基底数を増やして再評価してください。
+CSV results are grouped by split, input/target, resolution, and u/v/combined.
+`combined` is computed from the sum of the squared u/v norms.
+A zero field with zero reconstruction error is assigned a relative error of 0.
+To keep both components of every teacher state within 1%, check `min_K_all` in the u/v rows
+for both input and target in each split, and use the largest value.
+If any of these fields is blank, increase the basis size and evaluate again.
 
-Kは、**設定した基底に含まれるモードを固有値の昇順に並べた先頭K個**です。
-同一固有値では元の列順を保ち、1列ずつ評価します。
-FDMのKは `Kx_eff * Ky_eff` までの総モード数であり、
-最小Kをそのまま `--Kx` や `--Ky` に指定する意味ではありません。
-FEMの円盤基底は縮退モードを含むため、実効基底数が `--K` を上回る場合があります。
-設定範囲外のモードは追加せず、モデルの基底や学習設定も自動変更しません。
+K denotes **the first K modes in the configured basis, sorted by ascending eigenvalue**.
+Modes with equal eigenvalues retain their original column order and are evaluated one column at a time.
+For FDM, K is the total number of modes, up to `Kx_eff * Ky_eff`;
+the minimum K should not be used directly as `--Kx` or `--Ky`.
+The FEM disk basis includes degenerate modes, so its effective size may exceed `--K`.
+The evaluation does not add modes outside the configured range or automatically change the model basis or training settings.
 
-対象はFEMのdisk/cartesian/読み込み節点基底と、FDMの
-`--operator_type laplace`（Neumann・periodic）です。
-Fourier FNO経路では通常学習時に理由を表示して評価を省略し、
-`--reconstruction_only 1` では非対応をエラーで知らせます。
-診断用基底だけをfloat64で質量直交化し、全基底による残差を直接計算してから
-省略モードの二乗係数を加えるため、小さな誤差でも差し引きの桁落ちを抑えます。
+Supported bases are FEM disk, Cartesian, and loaded nodal bases, and FDM
+`--operator_type laplace` with Neumann or periodic boundary conditions.
+For Fourier FNO models, regular training skips this evaluation and prints the reason;
+`--reconstruction_only 1` raises an error because reconstruction evaluation is unsupported.
+Only the diagnostic basis is orthogonalized with respect to the mass inner product in float64.
+The full-basis residual is computed directly, then the squared coefficients of omitted modes are added.
+This reduces cancellation when errors are small.
 
-基底再構成は、密な質量行列を使う独立の最小二乗解との比較で検証しています。
+Basis reconstruction has been validated against an independent least-squares solution using a dense mass matrix.
 
-## 共通の変数名
+## Shared variable names
 
-| 名前 | 意味 |
+| Name | Meaning |
 |---|---|
-| `xb`, `yb`, `yh` | 入力・教師出力・モデル予測のバッチ |
-| `hist` | epochごとの学習履歴 |
-| `out_prefix` | 保存先ディレクトリを含むファイル名の接頭辞。CLIの `args.out_prefix` は名前部分 |
-| `opt`, `sched`, `scaler` | optimizer・学習率scheduler・AMP GradScaler |
-| `amp_torch_dtype` | AMPで使用するPyTorchのdtype |
-| `tr_u_sum`, `tr_v_sum`, `tr_n` | 学習誤差の累積値とサンプル数 |
-| `loss_each`, `loss_u_each`, `loss_v_each` | 各サンプルのu/v相対L2 |
-| `loss_weights` | 累積物理時間から計算した学習損失の重み |
-| `t_cumulative_b` | 各遷移の目標時刻に対応する累積物理時間 |
-| `dt_scale` | 入力の時間刻みを正規化・復元する尺度 |
-| `dt_physical` / 層の `dt_scalar` | 物理単位の時間刻み |
-| `spec`, `w1`, `fc0`, `fc1`, `fc2` | スペクトル層・点ごとの線形層・入出力の線形層 |
-| `Phi`, `P`, `mu` | 円盤の固有関数・質量重み付き射影・Laplace固有値 |
+| `xb`, `yb`, `yh` | Batches of inputs, teacher outputs, and model predictions |
+| `hist` | Training history for each epoch |
+| `out_prefix` | Output filename prefix including the directory; the CLI argument `args.out_prefix` contains only the name portion |
+| `opt`, `sched`, `scaler` | Optimizer, learning rate scheduler, and AMP GradScaler |
+| `amp_torch_dtype` | PyTorch dtype used for AMP |
+| `tr_u_sum`, `tr_v_sum`, `tr_n` | Accumulated training errors and sample count |
+| `loss_each`, `loss_u_each`, `loss_v_each` | Per-sample relative L2 errors for u/v |
+| `loss_weights` | Training loss weights computed from cumulative physical time |
+| `t_cumulative_b` | Cumulative physical time at the target of each transition |
+| `dt_scale` | Scale used to normalize and recover input time steps |
+| `dt_physical` / layer variable `dt_scalar` | Time step in physical units |
+| `spec`, `w1`, `fc0`, `fc1`, `fc2` | Spectral layers, pointwise linear layers, and input/output linear layers |
+| `Phi`, `P`, `mu` | Disk eigenfunctions, mass-weighted projection, and Laplace eigenvalues |
 
-時間依存層は両方とも既定で無効です。FEM側の時間依存層の数式は従来のままです。
-格子と円盤では基底・質量重み・入力標準化が異なります。各領域のモデル定義と
-実行入口に処理を分けており、同じ名前の関数でも引数やデータ形状は異なります。
+Time-dependent layers are disabled by default in both scripts.
+The FEM formulation for time-dependent layers is unchanged.
+The grid and disk implementations use different bases, mass weights, and input standardization.
+Each domain has its own model module and entry point, and functions with the same name
+may accept different arguments and data shapes.
 
-## 検証
+## Validation
 
 ```bash
 python squaredomain.py --smoke_test
 ```
 
-このスモークテストは教師データを用意せずに実行できます。
+This smoke test runs without teacher data.
 
-今回の構成変更では、開発環境の既存34テストで小規模CPU学習、再開、
-Fourierモデル、物理積分、出力形式、旧CLIと重みの互換性を確認しました。
-さらに10通りのモデル設定で、分割前後の基底、予測値、勾配、Adam更新、
-分割前のチェックポイントからの再開結果が一致することを確認しました。
-検証環境はPythonとPyTorch 2.8.0+cpu、NumPy 2.2.6、SciPy 1.15.3です。
+The file reorganization was checked using 34 existing tests in the development environment.
+These covered small CPU training runs, checkpoint resumption, Fourier models, physical integration,
+output formats, and compatibility with legacy CLI options and model weights.
+Across 10 model configurations, the bases, predictions, gradients, Adam updates,
+and results resumed from checkpoints created before the split were also confirmed to match
+before and after the reorganization.
+The validation environment used Python with PyTorch 2.8.0+cpu, NumPy 2.2.6, and SciPy 1.15.3.
